@@ -20,6 +20,8 @@
 #include "nvs_flash.h"
 #include "esp_eap_client.h"
 #include "esp_event.h"
+#include <time.h>
+#include "esp_sntp.h"
 
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
@@ -53,6 +55,8 @@
 #endif
 
 #define RESET_PIN_MASK ((1ULL << RESET_PIN))
+#define TIME_CONTROL_GPIO 41
+#define NTP_SERVER "pool.ntp.org"
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t wifi_event_group;
@@ -751,6 +755,53 @@ static void setLogLevel(void)
     }
 }
 
+void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "NTP time synced");
+}
+
+void initialize_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, NTP_SERVER);
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    sntp_init();
+}
+
+void *gpio_time_control_task(void *p)
+{
+    // Configure GPIO
+    gpio_reset_pin(TIME_CONTROL_GPIO);
+    gpio_set_direction(TIME_CONTROL_GPIO, GPIO_MODE_OUTPUT);
+    
+    time_t now;
+    struct tm timeinfo;
+
+    // Wait for NTP sync
+    int retry = 0;
+    const int retry_count = 10;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+        ESP_LOGI(TAG, "Waiting for NTP time sync... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+
+    while(1) {
+        time(&now);
+        localtime_r(&now, &timeinfo);
+
+        // Check if time is between 12:00 and 23:59
+        if (timeinfo.tm_hour >= 12 && timeinfo.tm_hour < 24) {
+            gpio_set_level(TIME_CONTROL_GPIO, 1);
+        } else {
+            gpio_set_level(TIME_CONTROL_GPIO, 0);
+        }
+
+        // Check every minute
+        vTaskDelay(60000 / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(void)
 {
     initialize_nvs();
@@ -760,6 +811,11 @@ void app_main(void)
         return;
     }
     setLogLevel();
+
+    // Initialize SNTP for time sync
+    initialize_sntp();
+    setenv("TZ", "GMT-1", 1);
+    tzset();
 
     initialize_console();
     /* Register commands */
@@ -881,6 +937,10 @@ void app_main(void)
         ESP_LOGW(TAG, "'nvs_namespace esp32_nat'");
         ESP_LOGW(TAG, "'nvs_set lock i32 -v 0'");
     }
+
+    // Create GPIO time control task
+    pthread_t gpio_time_thread;
+    pthread_create(&gpio_time_thread, NULL, gpio_time_control_task, NULL);
 
     /* Prompt to be printed before each line.
      * This can be customized, made dynamic, etc.
